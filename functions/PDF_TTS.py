@@ -6,6 +6,7 @@ import io
 import re
 import warnings
 from pathlib import Path
+from dataclasses import dataclass
 import tkinter as tk
 from tkinter import filedialog
 import fitz
@@ -41,12 +42,22 @@ OCR_DPI = 200
 
 HEADER_FOOTER_MIN_REPEATS = 2
 HEADER_FOOTER_MAX_CHARS = 90
+HEADER_FOOTER_TOP_FRACTION = 0.12
+HEADER_FOOTER_BOTTOM_FRACTION = 0.88
 
 SURYA_SKIP_LABELS = {
     "PageHeader", "PageFooter", "Picture", "Figure", "Diagram",
     "Table", "Form", "Equation", "Code", "ChemicalBlock",
     "BlankPage", "TableOfContents", "Footnote",
 }
+
+
+@dataclass
+class ExtractedParagraph:
+    text: str
+    top: float
+    bottom: float
+    label: str = ""
 
 
 def dehyphenate_and_join(block_text):
@@ -65,6 +76,7 @@ def html_block_to_text(html_str):
         br.replace_with("\n")
     text = soup.get_text(separator=" ")
     text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"-\s*\n\s*", "", text)
     text = re.sub(r"\s*\n\s*", " ", text)
     text = re.sub(r"\(\s+", "(", text)
     text = re.sub(r"\s+\)", ")", text)
@@ -72,36 +84,100 @@ def html_block_to_text(html_str):
     return text.strip()
 
 
-def looks_like_page_number(paragraph):
-    stripped = paragraph.strip()
-    return not stripped or re.fullmatch(r"\d{1,4}", stripped) is not None
+def _normalized_header_text(text):
+    text = re.sub(r"\d+", "", text.casefold())
+    return re.sub(r"[^a-z]+", "", text)
 
 
-def strip_repeated_headers_footers(pages_paragraphs, log):
+def _is_page_number_line(text):
+    return bool(
+        re.fullmatch(r"\d{1,4}", text.strip())
+        or re.match(r"^\d{1,4}\s+\S", text.strip())
+        or re.search(r"\S\s+\d{1,4}$", text.strip())
+    )
+
+
+def strip_page_headers_footers(pages_paragraphs, log):
     from collections import Counter
 
-    counts = Counter(
-        paragraph
-        for paragraphs in pages_paragraphs
-        for paragraph in paragraphs
-        if len(paragraph) <= HEADER_FOOTER_MAX_CHARS
-    )
-    noisy = {
-        paragraph
-        for paragraph, count in counts.items()
-        if count >= HEADER_FOOTER_MIN_REPEATS
-    }
-    if noisy:
-        log(f"Removing {len(noisy)} repeated header/footer line(s) found across pages.")
+    def is_in_margin(paragraph):
+        return (
+            paragraph.top <= HEADER_FOOTER_TOP_FRACTION
+            or paragraph.bottom >= HEADER_FOOTER_BOTTOM_FRACTION
+        )
 
-    return [
-        [
-            paragraph
+    repeated_headers = Counter()
+    for paragraphs in pages_paragraphs:
+        repeated_headers.update({
+            _normalized_header_text(paragraph.text)
             for paragraph in paragraphs
-            if paragraph not in noisy and not looks_like_page_number(paragraph)
-        ]
-        for paragraphs in pages_paragraphs
-    ]
+            if is_in_margin(paragraph)
+            and len(paragraph.text) <= HEADER_FOOTER_MAX_CHARS
+            and _normalized_header_text(paragraph.text)
+        })
+
+    cleaned_pages = []
+    removed_count = 0
+    for paragraphs in pages_paragraphs:
+        cleaned = []
+        for paragraph in paragraphs:
+            normalized = _normalized_header_text(paragraph.text)
+            is_page_furniture = (
+                is_in_margin(paragraph)
+                and (
+                    _is_page_number_line(paragraph.text)
+                    or (
+                        len(paragraph.text) <= HEADER_FOOTER_MAX_CHARS
+                        and repeated_headers[normalized] >= HEADER_FOOTER_MIN_REPEATS
+                    )
+                )
+            )
+            if is_page_furniture:
+                removed_count += 1
+            elif paragraph.text.strip():
+                cleaned.append(paragraph)
+        cleaned_pages.append(cleaned)
+
+    if removed_count:
+        log(f"Removed {removed_count} page header/footer line(s).")
+    return cleaned_pages
+
+
+def _is_heading(paragraph):
+    if "header" in paragraph.label.casefold() or paragraph.label.casefold() == "title":
+        return True
+    letters = re.sub(r"[^A-Za-z]", "", paragraph.text)
+    return len(paragraph.text) <= 120 and len(letters) >= 4 and letters.isupper()
+
+
+def _ends_sentence(text):
+    return bool(re.search(r"""[.!?]["'”’)\]]*\s*$""", text))
+
+
+def _join_page_boundary(previous, following):
+    if _is_heading(previous) or _is_heading(following) or _ends_sentence(previous.text):
+        return False
+    return True
+
+
+def join_page_paragraphs(pages_paragraphs):
+    joined_pages = []
+    for paragraphs in pages_paragraphs:
+        current = list(paragraphs)
+        if (
+            current
+            and joined_pages
+            and joined_pages[-1]
+            and _join_page_boundary(joined_pages[-1][-1], current[0])
+        ):
+            previous = joined_pages[-1][-1]
+            following = current.pop(0)
+            if re.search(r"-\s*$", previous.text) and following.text[:1].islower():
+                previous.text = re.sub(r"-\s*$", "", previous.text) + following.text
+            else:
+                previous.text = previous.text.rstrip() + " " + following.text.lstrip()
+        joined_pages.append(current)
+    return joined_pages
 
 
 def sort_native_blocks(blocks, page_width):
@@ -132,7 +208,7 @@ def sort_native_blocks(blocks, page_width):
     return sorted(blocks, key=lambda block: (round(block[1], 1), round(block[0], 1)))
 
 
-def surya_page_to_paragraphs(page_result):
+def surya_page_to_paragraphs(page_result, image_height):
     blocks = sorted(page_result.blocks, key=lambda block: block.reading_order)
     paragraphs = []
     for block in blocks:
@@ -140,7 +216,14 @@ def surya_page_to_paragraphs(page_result):
             continue
         text = html_block_to_text(block.html)
         if text:
-            paragraphs.append(text)
+            polygon = getattr(block, "polygon", None)
+            if polygon:
+                y_coordinates = [point[1] for point in polygon]
+                top = min(y_coordinates) / image_height
+                bottom = max(y_coordinates) / image_height
+            else:
+                top, bottom = 0.5, 0.5
+            paragraphs.append(ExtractedParagraph(text, top, bottom, block.label or ""))
     return paragraphs
 
 
@@ -181,8 +264,15 @@ def extract_pdf_paragraphs(pdf_path, log, surya, ocr_dpi=OCR_DPI, min_chars_per_
 
             if len(native_text) >= min_chars_per_page:
                 blocks = sort_native_blocks(page.get_text("blocks"), page.rect.width)
-                paragraphs = [dehyphenate_and_join(block[4]) for block in blocks if block[4].strip()]
-                pages_paragraphs[page_num] = [paragraph for paragraph in paragraphs if paragraph]
+                pages_paragraphs[page_num] = [
+                    ExtractedParagraph(
+                        dehyphenate_and_join(block[4]),
+                        block[1] / page.rect.height,
+                        block[3] / page.rect.height,
+                    )
+                    for block in blocks
+                    if block[4].strip()
+                ]
                 log(f"{page_label}: {len(pages_paragraphs[page_num])} paragraph(s) from native text")
             else:
                 zoom = ocr_dpi / 72
@@ -194,14 +284,15 @@ def extract_pdf_paragraphs(pdf_path, log, surya, ocr_dpi=OCR_DPI, min_chars_per_
             log(f"Running Surya OCR on {len(ocr_targets)} scanned page(s)...")
             predictor = surya.get_predictor(log)
             results = predictor([image for _, image in ocr_targets], full_page=True)
-            for (page_num, _), result in zip(ocr_targets, results):
-                paragraphs = surya_page_to_paragraphs(result)
+            for (page_num, image), result in zip(ocr_targets, results):
+                paragraphs = surya_page_to_paragraphs(result, image.height)
                 pages_paragraphs[page_num] = paragraphs
                 log(f"Page {page_num + 1}: {len(paragraphs)} paragraph(s) from Surya OCR")
 
-    pages_paragraphs = strip_repeated_headers_footers(pages_paragraphs, log)
+    pages_paragraphs = strip_page_headers_footers(pages_paragraphs, log)
+    pages_paragraphs = join_page_paragraphs(pages_paragraphs)
     return "\n\n".join(
-        paragraph
+        paragraph.text
         for paragraphs in pages_paragraphs
         for paragraph in paragraphs
     )
