@@ -1,0 +1,23 @@
+[workspace]
+name = "kokoro-tts"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64"]
+
+[dependencies]
+python = "3.12.*"
+pip = ">=26.2.1,<27"
+
+[pypi-dependencies]
+kokoro = "==0.9.4"
+ipython = "*"
+numpy = "*"
+soundfile = "*"
+torch = "*"
+pymupdf = "==1.26.7"
+pillow = "*"
+beautifulsoup4 = "*"
+surya-ocr = "*"
+
+[tasks]
+pdf = "python ./functions/PDF_TTS.py"
+txt = "python ./functions/TXT_TTS.py"

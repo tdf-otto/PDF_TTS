@@ -1,3 +1,10 @@
+# Directories
+voices/
+
+# pixi
+.pixi/
+pixi.lock
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
